@@ -1,0 +1,192 @@
+name: 🎬 AI Video Processor
+
+on:
+  repository_dispatch:
+    types: [process_video]
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: 📦 Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yt-dlp boto3 requests
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      
+      - name: 🎯 Extract Job Information
+        id: job-info
+        run: |
+          echo "job_id=${{ github.event.client_payload.job_id }}" >> $GITHUB_OUTPUT
+          echo "video_url=${{ github.event.client_payload.url }}" >> $GITHUB_OUTPUT
+          echo "callback_url=${{ github.event.client_payload.callback_url }}" >> $GITHUB_OUTPUT
+          echo "platform=${{ github.event.client_payload.platform }}" >> $GITHUB_OUTPUT
+
+      - name: 🎬 Process Video
+        env:
+          JOB_ID: ${{ steps.job-info.outputs.job_id }}
+          VIDEO_URL: ${{ steps.job-info.outputs.video_url }}
+          CALLBACK_URL: ${{ steps.job-info.outputs.callback_url }}
+          PLATFORM: ${{ steps.job-info.outputs.platform }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          import requests
+          import boto3
+          import time
+          from datetime import datetime
+          from yt_dlp import YoutubeDL
+
+          def send_callback(status, **kwargs):
+              """發送回調通知到 n8n"""
+              if not os.getenv('CALLBACK_URL'):
+                  print("🤫 No callback URL provided")
+                  return True
+                  
+              payload = {
+                  'job_id': os.getenv('JOB_ID'),
+                  'status': status,
+                  'platform': os.getenv('PLATFORM'),
+                  'processed_at': datetime.now().isoformat(),
+                  **kwargs
+              }
+              
+              try:
+                  response = requests.post(
+                      os.getenv('CALLBACK_URL'), 
+                      json=payload, 
+                      timeout=30
+                  )
+                  print(f"✅ Callback sent: {status}")
+                  return True
+              except Exception as e:
+                  print(f"❌ Callback failed: {e}")
+                  return False
+
+          def main():
+              job_id = os.getenv('JOB_ID')
+              video_url = os.getenv('VIDEO_URL')
+              platform = os.getenv('PLATFORM')
+              
+              print(f"🎬 Starting video processing: {job_id}")
+              print(f"📺 Platform: {platform}")
+              print(f"🔗 URL: {video_url}")
+              
+              start_time = time.time()
+              
+              try:
+                  # 1. 下載影片
+                  print("📥 Downloading video...")
+                  
+                  ydl_opts = {
+                      'format': 'best[height<=720]',  # 限制解析度節省時間
+                      'outtmpl': f'{job_id}.%(ext)s',
+                  }
+                  
+                  with YoutubeDL(ydl_opts) as ydl:
+                      info = ydl.extract_info(video_url, download=True)
+                      
+                  # 尋找下載的檔案
+                  import glob
+                  downloaded_files = glob.glob(f"{job_id}.*")
+                  if not downloaded_files:
+                      raise FileNotFoundError("No downloaded file found")
+                  
+                  filename = downloaded_files[0]
+                  file_size = os.path.getsize(filename)
+                  video_title = info.get('title', 'Unknown')
+                  video_duration = info.get('duration', 0)
+                  
+                  print(f"✅ Download complete: {filename} ({file_size} bytes)")
+
+                  # 2. 上傳到 R2
+                  print("☁️ Uploading to Cloudflare R2...")
+                  
+                  s3_client = boto3.client(
+                      's3',
+                      endpoint_url=os.getenv('R2_ENDPOINT'),
+                      aws_access_key_id=os.getenv('R2_ACCESS_KEY'),
+                      aws_secret_access_key=os.getenv('R2_SECRET_KEY'),
+                      region_name='auto'
+                  )
+                  
+                  # 決定檔案副檔名
+                  file_ext = filename.split('.')[-1]
+                  remote_path = f"videos/{job_id}.{file_ext}"
+                  
+                  s3_client.upload_file(
+                      filename, 
+                      os.getenv('R2_BUCKET'), 
+                      remote_path,
+                      ExtraArgs={
+                          'ContentType': f'video/{file_ext}',
+                          'Metadata': {
+                              'platform': platform,
+                              'processed_by': 'github-actions'
+                          }
+                      }
+                  )
+                  
+                  print(f"✅ Upload complete: {remote_path}")
+
+                  # 3. 清理本地檔案
+                  os.remove(filename)
+                  print("🗑️ Local file cleaned up")
+
+                  # 4. 計算處理時間並發送成功回調
+                  processing_time = round(time.time() - start_time, 2)
+                  
+                  send_callback(
+                      'completed',
+                      video_title=video_title,
+                      video_url=video_url,
+                      file_path=remote_path,
+                      file_size_mb=round(file_size / 1024 / 1024, 2),
+                      video_duration=video_duration,
+                      processing_time=processing_time
+                  )
+                  
+                  print(f"🎉 Job {job_id} completed in {processing_time}s!")
+
+              except Exception as e:
+                  processing_time = round(time.time() - start_time, 2)
+                  error_msg = str(e)
+                  
+                  print(f"❌ Error: {error_msg}")
+                  
+                  # 發送錯誤回調
+                  send_callback(
+                      'error',
+                      error_message=error_msg,
+                      processing_time=processing_time
+                  )
+                  
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: 📊 Job Summary
+        if: always()
+        run: |
+          echo "## 🎬 Video Processing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Job ID**: ${{ steps.job-info.outputs.job_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform**: ${{ steps.job-info.outputs.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
