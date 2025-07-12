@@ -33,7 +33,7 @@ jobs:
           echo "callback_url=${{ github.event.client_payload.callback_url }}" >> $GITHUB_OUTPUT
           echo "platform=${{ github.event.client_payload.platform }}" >> $GITHUB_OUTPUT
 
-      - name: 🎬 Process Video
+      - name: 🎬 Process Video with Cookie Support
         env:
           JOB_ID: ${{ steps.job-info.outputs.job_id }}
           VIDEO_URL: ${{ steps.job-info.outputs.video_url }}
@@ -43,7 +43,14 @@ jobs:
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
+          # 創建 cookies 文件
+          if [ ! -z "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > cookies.txt
+            echo "✅ YouTube cookies loaded"
+          fi
+          
           python3 << 'EOF'
           import os
           import sys
@@ -91,7 +98,7 @@ jobs:
               start_time = time.time()
               
               try:
-                  # 1. 下載影片
+                  # 1. 設定下載選項
                   print("📥 Downloading video...")
                   
                   ydl_opts = {
@@ -99,6 +106,12 @@ jobs:
                       'outtmpl': f'{job_id}.%(ext)s',
                   }
                   
+                  # 如果有 cookies 文件，使用它
+                  if os.path.exists('cookies.txt'):
+                      ydl_opts['cookiefile'] = 'cookies.txt'
+                      print("🍪 Using YouTube cookies for authentication")
+                  
+                  # 2. 下載影片
                   with YoutubeDL(ydl_opts) as ydl:
                       info = ydl.extract_info(video_url, download=True)
                       
@@ -115,7 +128,7 @@ jobs:
                   
                   print(f"✅ Download complete: {filename} ({file_size} bytes)")
 
-                  # 2. 上傳到 R2
+                  # 3. 上傳到 R2
                   print("☁️ Uploading to Cloudflare R2...")
                   
                   s3_client = boto3.client(
@@ -138,18 +151,20 @@ jobs:
                           'ContentType': f'video/{file_ext}',
                           'Metadata': {
                               'platform': platform,
-                              'processed_by': 'github-actions'
+                              'processed_by': 'github-actions-with-cookies'
                           }
                       }
                   )
                   
                   print(f"✅ Upload complete: {remote_path}")
 
-                  # 3. 清理本地檔案
+                  # 4. 清理本地檔案
                   os.remove(filename)
-                  print("🗑️ Local file cleaned up")
+                  if os.path.exists('cookies.txt'):
+                      os.remove('cookies.txt')
+                  print("🗑️ Files cleaned up")
 
-                  # 4. 計算處理時間並發送成功回調
+                  # 5. 計算處理時間並發送成功回調
                   processing_time = round(time.time() - start_time, 2)
                   
                   send_callback(
@@ -169,6 +184,10 @@ jobs:
                   error_msg = str(e)
                   
                   print(f"❌ Error: {error_msg}")
+                  
+                  # 清理文件
+                  if os.path.exists('cookies.txt'):
+                      os.remove('cookies.txt')
                   
                   # 發送錯誤回調
                   send_callback(
