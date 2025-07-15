@@ -7,7 +7,7 @@ on:
 jobs:
   process-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     
     # 集中管理所有環境變數
     env:
@@ -29,30 +29,78 @@ jobs:
       PLATFORM: ${{ github.event.client_payload.platform }}
       USER_NAME: ${{ github.event.client_payload.user_info.user_name }}
       CHAT_ID: ${{ github.event.client_payload.user_info.chat_id }}
+      
+      # 效能優化
+      PYTHONUNBUFFERED: 1
+      PIP_NO_CACHE_DIR: 1
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      
+      # 預設值（可通過 secrets 覆蓋）
+      DEFAULT_CHAT_ID: ${{ secrets.DEFAULT_CHAT_ID || 'system' }}
     
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            requirements.txt
+            scripts/
+          sparse-checkout-cone-mode: false
 
       - name: 🐍 Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: 📝 Create requirements.txt if not exists
+        run: |
+          # 如果 repo 中沒有 requirements.txt，創建一個
+          if [ ! -f requirements.txt ]; then
+            cat > requirements.txt << 'REQUIREMENTS'
+          # Core dependencies
+          yt-dlp==2024.11.18
+          boto3==1.35.0
+          requests==2.32.3
+          openai==1.54.0
+          tenacity==9.0.0
+          
+          # Optional dependencies for better performance
+          certifi>=2024.0.0
+          urllib3>=2.0.0,<3.0.0
+          REQUIREMENTS
+            echo "📝 Created requirements.txt"
+          fi
+          
+          # 顯示依賴項
+          echo "📦 Dependencies to install:"
+          cat requirements.txt
 
       - name: 📦 Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install yt-dlp boto3 requests openai tenacity
-          # ubuntu-latest 已包含 ffmpeg，無需安裝
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+          
+          # 安裝 ffmpeg（如果需要轉碼）
+          if [ "${{ env.PLATFORM }}" = "bilibili" ] || [ "${{ env.PLATFORM }}" = "douyin" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -qq ffmpeg
+          fi
 
       - name: 🔑 Setup YouTube Cookies
-        if: ${{ env.YOUTUBE_COOKIES != '' }}
+        if: env.YOUTUBE_COOKIES != '' && env.PLATFORM == 'youtube'
         run: echo "$YOUTUBE_COOKIES" > cookies.txt
 
       - name: 🎬 Process Video with AI Analysis
         run: |
-          python3 << 'EOF'
+          # 如果 scripts/video_processor.py 存在，使用它
+          if [ -f scripts/video_processor.py ]; then
+            echo "🐍 Using scripts/video_processor.py"
+            python scripts/video_processor.py
+          else
+            echo "🐍 Using embedded Python script"
+            python3 << 'EOF'
           import os
           import sys
           import requests
@@ -61,94 +109,510 @@ jobs:
           import json
           import re
           import glob
+          import subprocess
+          import hashlib
           from datetime import datetime
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
           from yt_dlp import YoutubeDL
-          from tenacity import retry, stop_after_attempt, wait_fixed
+          from tenacity import retry, stop_after_attempt, wait_exponential
 
-          @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
-          def send_callback(payload):
-              """發送回調通知到 n8n，帶重試機制"""
-              callback_url = payload.get('callback_url')
-              if not callback_url:
-                  print("🤫 No callback URL provided")
-                  return True
-              
-              print(f"📡 Sending callback to: {callback_url}")
-              print(f"📦 Payload keys: {list(payload.keys())}")
-                  
-              try:
-                  # 移除 callback_url 從 payload 中，避免發送給 n8n
-                  send_payload = {k: v for k, v in payload.items() if k != 'callback_url'}
-                  
-                  # 確保必要字段存在
-                  if 'status' not in send_payload:
-                      send_payload['status'] = 'completed'
-                  
-                  print(f"📤 Sending payload: {json.dumps(send_payload, indent=2)}")
-                  
-                  response = requests.post(callback_url, json=send_payload, timeout=30)
-                  response.raise_for_status()
-                  print(f"✅ Callback sent successfully: {response.status_code}")
-                  print(f"📥 Response: {response.text[:200]}...")
-                  return True
-              except Exception as e:
-                  print(f"❌ Callback failed: {e}")
-                  if hasattr(e, 'response'):
-                      print(f"📥 Error response: {e.response.text}")
-                  raise  # 重新拋出以觸發重試
+          # 設定日誌格式
+          import logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s',
+              datefmt='%Y-%m-%d %H:%M:%S'
+          )
+          logger = logging.getLogger(__name__)
 
-          def analyze_with_ai(video_title, video_description="", transcript=""):
-              """使用 AI 分析影片內容"""
-              try:
-                  openai_key = os.getenv('OPENAI_API_KEY')
-                  if not openai_key:
-                      print("🤖 No OpenAI API Key, using fallback analysis")
-                      return get_fallback_analysis(video_title, transcript)
+          class VideoProcessor:
+              def __init__(self, config):
+                  self.config = config
+                  self.base_payload = self._create_base_payload()
+                  self.start_time = time.time()
                   
-                  import openai
-                  client = openai.OpenAI(api_key=openai_key)
+              def _create_base_payload(self):
+                  """創建基本回調 payload"""
+                  # 使用環境變數中的預設值，而非硬編碼
+                  default_chat_id = self.config.get('default_chat_id', 'system')
                   
-                  analysis_prompt = f"""
-                  請分析以下影片內容並以 JSON 格式回應：
+                  return {
+                      'job_id': self.config['job_id'],
+                      'platform': self.config['platform'],
+                      'video_url': self.config['video_url'],
+                      'user_name': self.config['user_name'],
+                      'chat_id': self.config['chat_id'] if self.config['chat_id'] != 'Unknown' else default_chat_id,
+                      'callback_url': self.config['callback_url'],
+                      'completion_time': datetime.now().isoformat(),
+                  }
+
+              @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+              def send_callback(self, payload):
+                  """發送回調通知到 n8n，帶指數退避重試機制"""
+                  callback_url = payload.get('callback_url')
+                  if not callback_url:
+                      logger.info("🤫 No callback URL provided")
+                      return True
                   
-                  標題: {video_title}
-                  描述: {video_description[:500]}
-                  字幕: {transcript[:1000]}
+                  logger.info(f"📡 Sending callback to: {callback_url}")
                   
-                  請提供：
-                  {{
-                    "ai_keywords": "3-5個關鍵詞，用逗號分隔",
-                    "ai_sentiment": "positive/negative/neutral",
-                    "ai_category": "entertainment/education/news/technology/music/sports/gaming/other",
-                    "transcription_language": "繁體中文/簡體中文/英文/日文/韓文/other"
-                  }}
-                  """
+                  try:
+                      # 移除 callback_url 從 payload 中
+                      send_payload = {k: v for k, v in payload.items() if k != 'callback_url'}
+                      
+                      # 確保必要字段存在
+                      if 'status' not in send_payload:
+                          send_payload['status'] = 'completed'
+                      
+                      response = requests.post(
+                          callback_url, 
+                          json=send_payload, 
+                          timeout=30,
+                          headers={'Content-Type': 'application/json'}
+                      )
+                      response.raise_for_status()
+                      logger.info(f"✅ Callback sent successfully: {response.status_code}")
+                      return True
+                  except Exception as e:
+                      logger.error(f"❌ Callback failed: {e}")
+                      raise
+
+              def analyze_with_ai(self, video_title, video_description="", transcript=""):
+                  """使用 AI 分析影片內容"""
+                  try:
+                      openai_key = self.config.get('openai_api_key')
+                      if not openai_key:
+                          logger.info("🤖 No OpenAI API Key, using fallback analysis")
+                          return self._get_fallback_analysis(video_title, transcript)
+                      
+                      import openai
+                      client = openai.OpenAI(api_key=openai_key)
+                      
+                      # 限制輸入長度以節省 token
+                      description_limit = min(len(video_description), 500)
+                      transcript_limit = min(len(transcript), 1500)
+                      
+                      analysis_prompt = f"""
+                      分析以下影片內容並以 JSON 格式回應：
+                      
+                      標題: {video_title}
+                      描述: {video_description[:description_limit]}
+                      字幕摘要: {transcript[:transcript_limit]}
+                      
+                      請提供：
+                      {{
+                        "ai_keywords": "3-5個關鍵詞，用逗號分隔",
+                        "ai_sentiment": "positive/negative/neutral",
+                        "ai_category": "entertainment/education/news/technology/music/sports/gaming/other",
+                        "transcription_language": "繁體中文/簡體中文/英文/日文/韓文/other",
+                        "ai_summary": "50字以內的內容摘要"
+                      }}
+                      """
+                      
+                      response = client.chat.completions.create(
+                          model="gpt-3.5-turbo",
+                          messages=[
+                              {"role": "system", "content": "你是一個專業的影片內容分析助手。"},
+                              {"role": "user", "content": analysis_prompt}
+                          ],
+                          max_tokens=300,
+                          temperature=0.7,
+                          response_format={"type": "json_object"}
+                      )
+                      
+                      ai_result = json.loads(response.choices[0].message.content)
+                      ai_result['word_count'] = len(transcript.split()) if transcript else 0
+                      ai_result['analysis_timestamp'] = datetime.now().isoformat()
+                      return ai_result
+                      
+                  except Exception as e:
+                      logger.error(f"🤖 AI analysis failed: {e}")
+                      return self._get_fallback_analysis(video_title, transcript)
+
+              def _get_fallback_analysis(self, video_title, transcript):
+                  """備用分析方法"""
+                  # 提取有意義的關鍵詞
+                  words = re.findall(r'\b[a-zA-Z\u4e00-\u9fa5]{2,}\b', video_title)
+                  keywords = ', '.join(words[:5]) if words else 'unknown'
                   
-                  response = client.chat.completions.create(
-                      model="gpt-3.5-turbo",
-                      messages=[{"role": "user", "content": analysis_prompt}],
-                      max_tokens=200,
-                      response_format={"type": "json_object"}
+                  # 簡單的語言檢測
+                  if re.search(r'[\u4e00-\u9fa5]', transcript):
+                      if re.search(r'[繁體字特徵字如：這個為麼]', transcript):
+                          language = '繁體中文'
+                      else:
+                          language = '簡體中文'
+                  elif re.search(r'[a-zA-Z]', transcript):
+                      language = '英文'
+                  else:
+                      language = 'unknown'
+                  
+                  return {
+                      'ai_keywords': keywords,
+                      'ai_sentiment': 'neutral',
+                      'ai_category': 'other',
+                      'transcription_language': language,
+                      'word_count': len(transcript.split()) if transcript else 0,
+                      'ai_summary': f'影片標題：{video_title[:50]}',
+                      'analysis_timestamp': datetime.now().isoformat()
+                  }
+
+              def get_optimal_format(self, info):
+                  """根據平台選擇最佳下載格式"""
+                  platform = self.config['platform']
+                  
+                  # 平台特定格式
+                  platform_formats = {
+                      'youtube': 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
+                      'bilibili': 'best[height<=1080][ext=mp4]/best[ext=mp4]/best',
+                      'twitter': 'best[ext=mp4]/best',
+                      'instagram': 'best[ext=mp4]/best',
+                      'tiktok': 'best[ext=mp4]/best',
+                      'douyin': 'best[ext=mp4]/best'
+                  }
+                  
+                  return platform_formats.get(platform, 'best[ext=mp4]/best')
+
+              def download_video(self):
+                  """下載影片和字幕"""
+                  logger.info(f"📥 Downloading video from {self.config['platform']}...")
+                  
+                  ydl_opts = {
+                      'format': self.get_optimal_format(None),
+                      'outtmpl': f'{self.config["job_id"]}.%(ext)s',
+                      'quiet': False,
+                      'no_warnings': False,
+                      'extract_flat': False,
+                      'force_generic_extractor': False,
+                      'concurrent_fragment_downloads': 5,
+                      'buffer_size': 16384,
+                      'http_chunk_size': 10485760,  # 10MB chunks
+                  }
+                  
+                  # 字幕設定
+                  if self.config['platform'] in ['youtube', 'bilibili']:
+                      ydl_opts.update({
+                          'writeautomaticsub': True,
+                          'writesubtitles': True,
+                          'subtitleslangs': ['zh-Hant', 'zh-Hans', 'zh', 'en', 'ja', 'ko'],
+                          'subtitlesformat': 'vtt/srt/best',
+                      })
+                  
+                  # Cookie 設定
+                  if self.config['platform'] == 'youtube' and os.path.exists('cookies.txt'):
+                      ydl_opts['cookiefile'] = 'cookies.txt'
+                      logger.info("🍪 Using YouTube cookies")
+                  
+                  # 特定平台設定
+                  if self.config['platform'] == 'bilibili':
+                      ydl_opts['http_headers'] = {
+                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                          'Referer': 'https://www.bilibili.com'
+                      }
+                  
+                  # 執行下載
+                  with YoutubeDL(ydl_opts) as ydl:
+                      info = ydl.extract_info(self.config['video_url'], download=True)
+                  
+                  return info
+
+              def process_video_file(self, filename, info):
+                  """處理下載的影片檔案"""
+                  file_size = os.path.getsize(filename)
+                  
+                  # 檢查是否需要轉碼
+                  if file_size > 100 * 1024 * 1024:  # 100MB
+                      logger.info(f"🔄 Compressing large video file ({file_size / 1024 / 1024:.1f}MB)...")
+                      compressed_file = f"{self.config['job_id']}_compressed.mp4"
+                      
+                      # 使用 ffmpeg 壓縮
+                      ffmpeg_cmd = [
+                          'ffmpeg', '-i', filename,
+                          '-c:v', 'libx264',
+                          '-preset', 'fast',
+                          '-crf', '28',
+                          '-c:a', 'aac',
+                          '-b:a', '128k',
+                          '-movflags', '+faststart',
+                          '-y', compressed_file
+                      ]
+                      
+                      try:
+                          subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                          os.remove(filename)
+                          filename = compressed_file
+                          file_size = os.path.getsize(filename)
+                          logger.info(f"✅ Compressed to {file_size / 1024 / 1024:.1f}MB")
+                      except subprocess.CalledProcessError as e:
+                          logger.warning(f"⚠️ Compression failed: {e}")
+                  
+                  return filename, file_size
+
+              def process_subtitles(self):
+                  """處理字幕檔案"""
+                  transcript = ""
+                  subtitle_files = glob.glob(f"{self.config['job_id']}*.vtt") + \
+                                  glob.glob(f"{self.config['job_id']}*.srt")
+                  
+                  if subtitle_files:
+                      logger.info(f"📝 Found {len(subtitle_files)} subtitle files")
+                      
+                      # 選擇最佳字幕檔案（優先選擇中文）
+                      priority_langs = ['zh-Hant', 'zh-Hans', 'zh', 'en']
+                      selected_file = None
+                      
+                      for lang in priority_langs:
+                          for file in subtitle_files:
+                              if lang in file:
+                                  selected_file = file
+                                  break
+                          if selected_file:
+                              break
+                      
+                      if not selected_file:
+                          selected_file = subtitle_files[0]
+                      
+                      # 讀取並清理字幕
+                      with open(selected_file, 'r', encoding='utf-8') as f:
+                          transcript_raw = f.read()
+                      
+                      # 清理字幕格式
+                      transcript = self._clean_transcript(transcript_raw)
+                      
+                      return transcript, selected_file
+                  
+                  return "", None
+
+              def _clean_transcript(self, transcript_raw):
+                  """清理字幕文本"""
+                  # 移除 WEBVTT 標頭
+                  transcript = re.sub(r'WEBVTT\r?\n\r?\n', '', transcript_raw)
+                  
+                  # 移除時間戳
+                  transcript = re.sub(r'\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}\r?\n', '', transcript)
+                  
+                  # 移除 SRT 序號
+                  transcript = re.sub(r'^\d+\r?\n', '', transcript, flags=re.MULTILINE)
+                  
+                  # 移除 HTML 標籤
+                  transcript = re.sub(r'<[^>]+>', '', transcript)
+                  
+                  # 合併多餘的換行和空格
+                  transcript = re.sub(r'\n+', ' ', transcript)
+                  transcript = ' '.join(transcript.split())
+                  
+                  return transcript
+
+              def upload_to_r2(self, local_path, remote_path, content_type='application/octet-stream'):
+                  """上傳檔案到 Cloudflare R2"""
+                  s3_client = boto3.client(
+                      's3',
+                      endpoint_url=f"https://{self.config['cf_account_id']}.r2.cloudflarestorage.com",
+                      aws_access_key_id=self.config['cf_r2_access_key'],
+                      aws_secret_access_key=self.config['cf_r2_secret_key'],
+                      region_name='auto'
                   )
                   
-                  ai_result = json.loads(response.choices[0].message.content)
-                  ai_result['word_count'] = len(transcript.split()) if transcript else 0
-                  return ai_result
+                  # 計算檔案 hash（用於去重）
+                  file_hash = self._calculate_file_hash(local_path)
                   
-              except Exception as e:
-                  print(f"🤖 AI analysis failed: {e}")
-                  return get_fallback_analysis(video_title, transcript)
+                  extra_args = {
+                      'ContentType': content_type,
+                      'Metadata': {
+                          'platform': self.config['platform'],
+                          'user_name': self.config['user_name'],
+                          'job_id': self.config['job_id'],
+                          'file_hash': file_hash,
+                          'upload_time': datetime.now().isoformat(),
+                          'processed_by': 'github-actions-optimized-v3'
+                      }
+                  }
+                  
+                  # 使用多部分上傳處理大檔案
+                  file_size = os.path.getsize(local_path)
+                  if file_size > 50 * 1024 * 1024:  # 50MB
+                      config = boto3.s3.transfer.TransferConfig(
+                          multipart_threshold=1024 * 25,  # 25MB
+                          max_concurrency=10,
+                          multipart_chunksize=1024 * 25,
+                          use_threads=True
+                      )
+                      s3_client.upload_file(
+                          local_path,
+                          self.config['cf_r2_bucket'],
+                          remote_path,
+                          ExtraArgs=extra_args,
+                          Config=config
+                      )
+                  else:
+                      s3_client.upload_file(
+                          local_path,
+                          self.config['cf_r2_bucket'],
+                          remote_path,
+                          ExtraArgs=extra_args
+                      )
+                  
+                  return file_hash
 
-          def get_fallback_analysis(video_title, transcript):
-              """備用分析方法"""
-              keywords = ', '.join(re.findall(r'\b\w{3,}\b', video_title.lower())[:5])
-              return {
-                  'ai_keywords': keywords if keywords else 'unknown',
-                  'ai_sentiment': 'neutral',
-                  'ai_category': 'other',
-                  'transcription_language': 'unknown',
-                  'word_count': len(transcript.split()) if transcript else 0
-              }
+              def _calculate_file_hash(self, filepath, chunk_size=8192):
+                  """計算檔案的 SHA256 hash"""
+                  sha256 = hashlib.sha256()
+                  with open(filepath, 'rb') as f:
+                      while chunk := f.read(chunk_size):
+                          sha256.update(chunk)
+                  return sha256.hexdigest()
+
+              def run(self):
+                  """執行主要處理流程"""
+                  logger.info(f"🎬 Starting video processing: {self.config['job_id']}")
+                  logger.info(f"📺 Platform: {self.config['platform']}")
+                  logger.info(f"👤 User: {self.config['user_name']} (Chat ID: {self.config['chat_id']})")
+                  
+                  try:
+                      # 1. 下載影片
+                      info = self.download_video()
+                      
+                      # 2. 找到下載的檔案
+                      video_files = glob.glob(f"{self.config['job_id']}.*")
+                      video_files = [f for f in video_files if not f.endswith(('.vtt', '.srt', '.txt'))]
+                      
+                      if not video_files:
+                          raise FileNotFoundError("No video file found after download")
+                      
+                      filename = video_files[0]
+                      
+                      # 3. 處理影片檔案（可能壓縮）
+                      filename, file_size = self.process_video_file(filename, info)
+                      
+                      # 提取影片資訊
+                      video_title = info.get('title', 'Unknown')
+                      video_description = info.get('description', '')
+                      video_duration = info.get('duration', 0)
+                      video_thumbnail = info.get('thumbnail', '')
+                      
+                      logger.info(f"✅ Processed: {filename} ({file_size / 1024 / 1024:.1f}MB)")
+                      
+                      # 4. 處理字幕
+                      transcript, subtitle_file = self.process_subtitles()
+                      
+                      # 5. AI 分析（異步執行）
+                      logger.info("🤖 Analyzing content...")
+                      ai_analysis = self.analyze_with_ai(video_title, video_description, transcript)
+                      
+                      # 6. 並行上傳到 R2
+                      logger.info("☁️ Uploading to Cloudflare R2...")
+                      
+                      # 準備上傳任務
+                      file_ext = filename.split('.')[-1]
+                      remote_video_path = f"videos/{self.config['job_id']}.{file_ext}"
+                      remote_subtitle_path = f"subtitles/{self.config['job_id']}.vtt" if subtitle_file else ""
+                      
+                      # 並行上傳
+                      with ThreadPoolExecutor(max_workers=2) as executor:
+                          futures = []
+                          
+                          # 上傳影片
+                          futures.append(
+                              executor.submit(
+                                  self.upload_to_r2,
+                                  filename,
+                                  remote_video_path,
+                                  f'video/{file_ext}'
+                              )
+                          )
+                          
+                          # 上傳字幕（如果有）
+                          if subtitle_file:
+                              futures.append(
+                                  executor.submit(
+                                      self.upload_to_r2,
+                                      subtitle_file,
+                                      remote_subtitle_path,
+                                      'text/vtt'
+                                  )
+                              )
+                          
+                          # 等待所有上傳完成
+                          for future in as_completed(futures):
+                              try:
+                                  future.result()
+                              except Exception as e:
+                                  logger.error(f"Upload failed: {e}")
+                                  raise
+                      
+                      logger.info(f"✅ Uploaded to: {remote_video_path}")
+                      
+                      # 7. 準備成功回調
+                      processing_time = round(time.time() - self.start_time, 2)
+                      
+                      # 生成公開 URL（如果配置了）
+                      public_url = ""
+                      if self.config.get('cf_r2_public_domain'):
+                          public_url = f"https://{self.config['cf_r2_public_domain']}/{remote_video_path}"
+                      
+                      success_payload = {
+                          **self.base_payload,
+                          'status': 'completed',
+                          'video_title': video_title,
+                          'video_thumbnail': video_thumbnail,
+                          'file_path': remote_video_path,
+                          'public_url': public_url,
+                          'file_size_mb': round(file_size / 1024 / 1024, 2),
+                          'video_duration': video_duration,
+                          'processing_time': processing_time,
+                          'transcript_file': remote_subtitle_path,
+                          'subtitle_file': remote_subtitle_path,
+                          'has_subtitles': bool(subtitle_file),
+                          **ai_analysis
+                      }
+                      
+                      # 8. 發送成功回調
+                      self.send_callback(success_payload)
+                      logger.info(f"🎉 Job {self.config['job_id']} completed in {processing_time}s!")
+                      
+                  except Exception as e:
+                      processing_time = round(time.time() - self.start_time, 2)
+                      error_msg = str(e)
+                      
+                      logger.error(f"❌ Processing failed: {error_msg}")
+                      
+                      # 發送錯誤回調
+                      error_payload = {
+                          **self.base_payload,
+                          'status': 'error',
+                          'error_message': error_msg,
+                          'error_type': type(e).__name__,
+                          'processing_time': processing_time
+                      }
+                      
+                      try:
+                          self.send_callback(error_payload)
+                      except:
+                          logger.error("❌ Failed to send error callback")
+                      
+                      sys.exit(1)
+                      
+                  finally:
+                      # 清理臨時文件
+                      self._cleanup()
+
+              def _cleanup(self):
+                  """清理臨時文件"""
+                  patterns = [
+                      f"{self.config['job_id']}*",
+                      "cookies.txt",
+                      "*.part",
+                      "*.ytdl",
+                      "*.temp"
+                  ]
+                  
+                  for pattern in patterns:
+                      for temp_file in glob.glob(pattern):
+                          try:
+                              os.remove(temp_file)
+                              logger.debug(f"🗑️ Removed: {temp_file}")
+                          except Exception as e:
+                              logger.warning(f"⚠️ Failed to remove {temp_file}: {e}")
 
           def main():
               # 獲取環境變數
@@ -156,204 +620,76 @@ jobs:
                   'job_id': os.getenv('JOB_ID'),
                   'video_url': os.getenv('VIDEO_URL'),
                   'callback_url': os.getenv('CALLBACK_URL'),
-                  'platform': os.getenv('PLATFORM'),
+                  'platform': os.getenv('PLATFORM', 'youtube').lower(),
                   'user_name': os.getenv('USER_NAME', 'Unknown'),
                   'chat_id': os.getenv('CHAT_ID', 'Unknown'),
                   'cf_account_id': os.getenv('CF_ACCOUNT_ID'),
                   'cf_r2_access_key': os.getenv('CF_R2_ACCESS_KEY'),
                   'cf_r2_secret_key': os.getenv('CF_R2_SECRET_KEY'),
                   'cf_r2_bucket': os.getenv('CF_R2_BUCKET'),
+                  'cf_r2_public_domain': os.getenv('CF_R2_PUBLIC_DOMAIN'),
+                  'openai_api_key': os.getenv('OPENAI_API_KEY'),
+                  'default_chat_id': os.getenv('DEFAULT_CHAT_ID', 'system'),
               }
               
-              print(f"🎬 Starting video processing: {config['job_id']}")
-              print(f"📺 Platform: {config['platform']}")
-              print(f"👤 User: {config['user_name']} (Chat ID: {config['chat_id']})")
+              # 驗證必要參數
+              required_fields = ['job_id', 'video_url', 'cf_account_id', 'cf_r2_access_key', 
+                               'cf_r2_secret_key', 'cf_r2_bucket']
               
-              start_time = time.time()
-              
-              # 基本回調 payload
-              base_payload = {
-                  'job_id': config['job_id'],
-                  'platform': config['platform'],
-                  'video_url': config['video_url'],
-                  'user_name': config['user_name'],
-                  'chat_id': config['chat_id'] if config['chat_id'] != 'Unknown' else '660156312',
-                  'callback_url': config['callback_url'],
-                  'completion_time': datetime.now().isoformat(),
-              }
-              
-              # 調試輸出
-              print(f"🔍 Debug - Config values:")
-              print(f"  Job ID: {config['job_id']}")
-              print(f"  Platform: {config['platform']}")
-              print(f"  User: {config['user_name']}")
-              print(f"  Chat ID: {config['chat_id']}")
-              print(f"  Callback URL: {config['callback_url']}")
-              print(f"  Video URL: {config['video_url']}")
-              
-              try:
-                  # 1. 設定下載選項
-                  print("📥 Downloading video...")
-                  ydl_opts = {
-                      'format': 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
-                      'outtmpl': f'{config["job_id"]}.%(ext)s',
-                      'writeautomaticsub': True,
-                      'writesubtitles': True,
-                      'subtitleslangs': ['zh-Hant', 'zh-Hans', 'zh', 'en'],
-                      'subtitlesformat': 'vtt',
-                  }
-                  
-                  # 如果有 cookies 文件，使用它
-                  if os.path.exists('cookies.txt'):
-                      ydl_opts['cookiefile'] = 'cookies.txt'
-                      print("🍪 Using YouTube cookies")
-                  
-                  # 2. 下載影片
-                  with YoutubeDL(ydl_opts) as ydl:
-                      info = ydl.extract_info(config['video_url'], download=True)
-                  
-                  # 3. 找到下載的檔案
-                  video_files = glob.glob(f"{config['job_id']}.*")
-                  video_files = [f for f in video_files if not f.endswith('.vtt')]
-                  
-                  if not video_files:
-                      raise FileNotFoundError("No video file found after download")
-                  
-                  filename = video_files[0]
-                  file_size = os.path.getsize(filename)
-                  video_title = info.get('title', 'Unknown')
-                  video_description = info.get('description', '')
-                  video_duration = info.get('duration', 0)
-                  
-                  print(f"✅ Downloaded: {filename} ({file_size} bytes)")
-                  
-                  # 4. 處理字幕
-                  transcript = ""
-                  subtitle_files = glob.glob(f"{config['job_id']}*.vtt")
-                  
-                  if subtitle_files:
-                      print(f"📝 Found {len(subtitle_files)} subtitle files")
-                      with open(subtitle_files[0], 'r', encoding='utf-8') as f:
-                          transcript_raw = f.read()
-                      
-                      # 清理字幕格式
-                      transcript = re.sub(r'WEBVTT\n\n', '', transcript_raw)
-                      transcript = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\n', '', transcript)
-                      transcript = re.sub(r'<[^>]+>', '', transcript)
-                      transcript = ' '.join(transcript.split())
-                  
-                  # 5. AI 分析
-                  print("🤖 Analyzing content...")
-                  ai_analysis = analyze_with_ai(video_title, video_description, transcript)
-                  
-                  # 6. 上傳到 Cloudflare R2
-                  print("☁️ Uploading to Cloudflare R2...")
-                  s3_client = boto3.client(
-                      's3',
-                      endpoint_url=f"https://{config['cf_account_id']}.r2.cloudflarestorage.com",
-                      aws_access_key_id=config['cf_r2_access_key'],
-                      aws_secret_access_key=config['cf_r2_secret_key'],
-                      region_name='auto'
-                  )
-                  
-                  # 上傳影片
-                  file_ext = filename.split('.')[-1]
-                  remote_path = f"videos/{config['job_id']}.{file_ext}"
-                  
-                  s3_client.upload_file(
-                      filename,
-                      config['cf_r2_bucket'],
-                      remote_path,
-                      ExtraArgs={
-                          'ContentType': f'video/{file_ext}',
-                          'Metadata': {
-                              'platform': config['platform'],
-                              'user_name': config['user_name'],
-                              'processed_by': 'github-actions-optimized'
-                          }
-                      }
-                  )
-                  
-                  # 上傳字幕文件
-                  subtitle_path = ""
-                  if subtitle_files:
-                      subtitle_path = f"subtitles/{config['job_id']}.vtt"
-                      s3_client.upload_file(
-                          subtitle_files[0],
-                          config['cf_r2_bucket'],
-                          subtitle_path,
-                          ExtraArgs={'ContentType': 'text/vtt'}
-                      )
-                  
-                  print(f"✅ Uploaded to: {remote_path}")
-                  
-                  # 7. 準備成功回調
-                  processing_time = round(time.time() - start_time, 2)
-                  success_payload = {
-                      **base_payload,
-                      'status': 'completed',
-                      'video_title': video_title,
-                      'file_path': remote_path,
-                      'file_size_mb': round(file_size / 1024 / 1024, 2),
-                      'video_duration': video_duration,
-                      'processing_time': processing_time,
-                      'transcript_file': subtitle_path,
-                      'subtitle_file': subtitle_path,
-                      **ai_analysis
-                  }
-                  
-                  # 8. 發送成功回調
-                  send_callback(success_payload)
-                  print(f"🎉 Job {config['job_id']} completed in {processing_time}s!")
-                  
-              except Exception as e:
-                  processing_time = round(time.time() - start_time, 2)
-                  error_msg = str(e)
-                  
-                  print(f"❌ Processing failed: {error_msg}")
-                  
-                  # 發送錯誤回調
-                  error_payload = {
-                      **base_payload,
-                      'status': 'error',
-                      'error_message': error_msg,
-                      'processing_time': processing_time
-                  }
-                  
-                  try:
-                      send_callback(error_payload)
-                  except:
-                      print("❌ Failed to send error callback")
-                  
+              missing_fields = [field for field in required_fields if not config.get(field)]
+              if missing_fields:
+                  logger.error(f"❌ Missing required fields: {missing_fields}")
                   sys.exit(1)
-                  
-              finally:
-                  # 清理臨時文件
-                  for pattern in [f"{config['job_id']}*", "cookies.txt"]:
-                      for temp_file in glob.glob(pattern):
-                          try:
-                              os.remove(temp_file)
-                          except:
-                              pass
+              
+              # 執行處理
+              processor = VideoProcessor(config)
+              processor.run()
 
           if __name__ == "__main__":
               main()
           EOF
+          fi
 
       - name: 🗑️ Cleanup
         if: always()
         run: |
+          # 清理所有臨時文件
           rm -f cookies.txt
           rm -f ${{ env.JOB_ID }}*
+          rm -f *.part *.ytdl *.temp
+          
+          # 清理 pip 快取（減少儲存空間）
+          pip cache purge || true
 
       - name: 📊 Job Summary
         if: always()
         run: |
           echo "## 🎬 Video Processing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 基本資訊表格
+          echo "### 📋 基本資訊" >> $GITHUB_STEP_SUMMARY
           echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Job ID** | \`${{ env.JOB_ID }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Platform** | ${{ env.PLATFORM }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **User** | ${{ env.USER_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | **${{ job.status }}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Timestamp** | $(date) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | ${{ github.run_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Timestamp** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 處理詳情
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ 處理成功" >> $GITHUB_STEP_SUMMARY
+            echo "影片已成功下載、分析並上傳到 Cloudflare R2。" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ 處理失敗" >> $GITHUB_STEP_SUMMARY
+            echo "請檢查上方的錯誤日誌以瞭解詳情。" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # 影片連結
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 相關連結" >> $GITHUB_STEP_SUMMARY
+          echo "- [原始影片](${{ env.VIDEO_URL }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [查看工作流程運行](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
