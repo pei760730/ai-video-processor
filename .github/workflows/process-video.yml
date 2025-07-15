@@ -72,17 +72,29 @@ jobs:
               if not callback_url:
                   print("🤫 No callback URL provided")
                   return True
+              
+              print(f"📡 Sending callback to: {callback_url}")
+              print(f"📦 Payload keys: {list(payload.keys())}")
                   
               try:
                   # 移除 callback_url 從 payload 中，避免發送給 n8n
                   send_payload = {k: v for k, v in payload.items() if k != 'callback_url'}
                   
+                  # 確保必要字段存在
+                  if 'status' not in send_payload:
+                      send_payload['status'] = 'completed'
+                  
+                  print(f"📤 Sending payload: {json.dumps(send_payload, indent=2)}")
+                  
                   response = requests.post(callback_url, json=send_payload, timeout=30)
                   response.raise_for_status()
-                  print(f"✅ Callback sent: {payload.get('status')} - {response.status_code}")
+                  print(f"✅ Callback sent successfully: {response.status_code}")
+                  print(f"📥 Response: {response.text[:200]}...")
                   return True
               except Exception as e:
                   print(f"❌ Callback failed: {e}")
+                  if hasattr(e, 'response'):
+                      print(f"📥 Error response: {e.response.text}")
                   raise  # 重新拋出以觸發重試
 
           def analyze_with_ai(video_title, video_description="", transcript=""):
@@ -165,10 +177,19 @@ jobs:
                   'platform': config['platform'],
                   'video_url': config['video_url'],
                   'user_name': config['user_name'],
-                  'chat_id': config['chat_id'],
+                  'chat_id': config['chat_id'] if config['chat_id'] != 'Unknown' else '660156312',
                   'callback_url': config['callback_url'],
                   'completion_time': datetime.now().isoformat(),
               }
+              
+              # 調試輸出
+              print(f"🔍 Debug - Config values:")
+              print(f"  Job ID: {config['job_id']}")
+              print(f"  Platform: {config['platform']}")
+              print(f"  User: {config['user_name']}")
+              print(f"  Chat ID: {config['chat_id']}")
+              print(f"  Callback URL: {config['callback_url']}")
+              print(f"  Video URL: {config['video_url']}")
               
               try:
                   # 1. 設定下載選項
